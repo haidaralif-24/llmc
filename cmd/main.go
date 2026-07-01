@@ -8,16 +8,21 @@ import (
 
 	"llmc/internal/config"
 	"llmc/internal/provider"
+	"llmc/internal/tui"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, `usage: llmc <command> [arguments]
-
-commands:
-  ask          send a prompt and print the reply
-  config init  create default config.toml`)
-		os.Exit(1)
+		cfg, err := config.Load()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		if err := tui.Run(cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	var err error

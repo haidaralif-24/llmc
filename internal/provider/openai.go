@@ -1,12 +1,13 @@
 package provider
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
+	"strings"
 )
 
 // OpenAICompatible implements Provider for any OpenAI-compatible chat
@@ -31,15 +32,16 @@ type openAIMessage struct {
 	Content string `json:"content"`
 }
 
-type openAIResponse struct {
+type openAIChunk struct {
 	Choices []struct {
-		Message struct {
+		Index int `json:"index"`
+		Delta struct {
 			Content string `json:"content"`
-		} `json:"message"`
+		} `json:"delta"`
 	} `json:"choices"`
 	Error *struct {
 		Message string `json:"message"`
-	} `json:"error"`
+	} `json:"error,omitempty"`
 }
 
 func (p *OpenAICompatible) Stream(ctx context.Context, model string, messages []Message) (<-chan Token, error) {
@@ -50,7 +52,7 @@ func (p *OpenAICompatible) Stream(ctx context.Context, model string, messages []
 	body, err := json.Marshal(openAIRequest{
 		Model:    model,
 		Messages: toOpenAIMessages(messages),
-		Stream:   false,
+		Stream:   true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%s: encode request: %w", p.Label, err)
@@ -61,6 +63,7 @@ func (p *OpenAICompatible) Stream(ctx context.Context, model string, messages []
 		return nil, fmt.Errorf("%s: build request: %w", p.Label, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
 	if p.APIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+p.APIKey)
 	}
@@ -70,7 +73,7 @@ func (p *OpenAICompatible) Stream(ctx context.Context, model string, messages []
 		client = http.DefaultClient
 	}
 
-	ch := make(chan Token, 2)
+	ch := make(chan Token, 8)
 	go func() {
 		defer close(ch)
 
@@ -81,33 +84,44 @@ func (p *OpenAICompatible) Stream(ctx context.Context, model string, messages []
 		}
 		defer resp.Body.Close()
 
-		raw, err := io.ReadAll(resp.Body)
-		if err != nil {
-			ch <- Token{Err: fmt.Errorf("%s: read response: %w", p.Label, err)}
-			return
-		}
-
-		var parsed openAIResponse
-		if jsonErr := json.Unmarshal(raw, &parsed); jsonErr != nil {
-			ch <- Token{Err: fmt.Errorf("%s: decode response (status %s): %w", p.Label, resp.Status, jsonErr)}
-			return
-		}
-
 		if resp.StatusCode != http.StatusOK {
-			msg := resp.Status
-			if parsed.Error != nil {
-				msg = parsed.Error.Message
-			}
-			ch <- Token{Err: fmt.Errorf("%s: %s", p.Label, msg)}
+			ch <- Token{Err: fmt.Errorf("%s: %s", p.Label, resp.Status)}
 			return
 		}
 
-		var text string
-		for _, choice := range parsed.Choices {
-			text += choice.Message.Content
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := strings.TrimPrefix(line, "data: ")
+			if data == "[DONE]" {
+				ch <- Token{Done: true}
+				return
+			}
+
+			var chunk openAIChunk
+			if jsonErr := json.Unmarshal([]byte(data), &chunk); jsonErr != nil {
+				continue
+			}
+			if chunk.Error != nil {
+				ch <- Token{Err: fmt.Errorf("%s: %s", p.Label, chunk.Error.Message)}
+				return
+			}
+			for _, choice := range chunk.Choices {
+				if choice.Delta.Content != "" {
+					ch <- Token{Text: choice.Delta.Content}
+				}
+			}
 		}
-		ch <- Token{Text: text}
-		ch <- Token{Done: true}
+
+		if err := scanner.Err(); err != nil {
+			ch <- Token{Err: fmt.Errorf("%s: read stream: %w", p.Label, err)}
+		} else {
+			ch <- Token{Done: true}
+		}
 	}()
 
 	return ch, nil
