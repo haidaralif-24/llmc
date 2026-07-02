@@ -42,7 +42,7 @@ type streamMsg struct {
 	tok provider.Token
 }
 
-func initialModel(cfg *config.Config, prov provider.Provider, provName, modelName string) model {
+func initialModel(cfg *config.Config, prov provider.Provider, provName, modelName string) *model {
 	vp := viewport.New(80, 20)
 	vp.Style = lipgloss.NewStyle().
 		BorderStyle(lipgloss.NormalBorder()).
@@ -53,7 +53,7 @@ func initialModel(cfg *config.Config, prov provider.Provider, provName, modelNam
 	ti.Focus()
 	ti.Width = 80
 
-	return model{
+	return &model{
 		cfg:      cfg,
 		prov:     prov,
 		provName: provName,
@@ -87,11 +87,11 @@ func Run(cfg *config.Config) error {
 	return err
 }
 
-func (m model) Init() tea.Cmd {
+func (m *model) Init() tea.Cmd {
 	return nil
 }
 
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -107,7 +107,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.streaming {
 		switch msg.String() {
 		case "esc":
@@ -133,7 +133,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m model) handleResize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
+func (m *model) handleResize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 	headerHeight := 0
 	footerHeight := 1
 
@@ -152,7 +152,7 @@ func (m model) handleResize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) handleStream(msg streamMsg) (tea.Model, tea.Cmd) {
+func (m *model) handleStream(msg streamMsg) (tea.Model, tea.Cmd) {
 	tok := msg.tok
 	if tok.Err != nil {
 		if errors.Is(tok.Err, context.Canceled) {
@@ -188,7 +188,7 @@ func (m model) handleStream(msg streamMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) submitMessage() (tea.Model, tea.Cmd) {
+func (m *model) submitMessage() (tea.Model, tea.Cmd) {
 	text := strings.TrimSpace(m.input.Value())
 	if text == "" {
 		return m, nil
@@ -231,7 +231,7 @@ func toProviderMessages(msgs []chatMessage) []provider.Message {
 	return pmsgs
 }
 
-func (m model) updateViewport() {
+func (m *model) updateViewport() {
 	var b strings.Builder
 	for _, msg := range m.messages {
 		label := msg.role
@@ -248,7 +248,7 @@ func (m model) updateViewport() {
 	m.viewport.SetContent(b.String())
 }
 
-func (m model) View() string {
+func (m *model) View() string {
 	if !m.ready {
 		return "\n  Initializing..."
 	}

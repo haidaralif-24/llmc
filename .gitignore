@@ -1,0 +1,21 @@
+# Compiled binary (build with: go build -o llmc ./cmd)
+/llmc
+/llmc.exe
+
+# Build/test artifacts
+*.test
+*.out
+/dist/
+/bin/
+
+# Local config that may contain a literal api_key (see config.ResolveKey)
+# Real users' actual config lives at $XDG_CONFIG_HOME/llmc or ~/.config/llmc,
+# outside the repo — this just guards against an accidental local copy.
+/config.toml
+/*.local.toml
+
+# Editor/OS cruft
+.DS_Store
+*.swp
+.vscode/
+.idea/

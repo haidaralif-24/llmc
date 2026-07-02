@@ -1,13 +1,12 @@
 package provider
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
-	"strings"
 )
 
 const (
@@ -39,9 +38,33 @@ type anthropicMessage struct {
 	Content string `json:"content"`
 }
 
-// Stream sends a streaming request and returns a channel of incremental
-// tokens as they arrive via SSE.
+// anthropicError is the shape of a non-streaming error body, and also of
+// the payload on an in-stream "event: error" (both nest error the same way).
+type anthropicError struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+}
+
+// anthropicStreamEvent covers the union of fields used across the event
+// types llmc cares about (content_block_delta, message_stop, error).
+// Unrelated fields on other event types (message_start, ping,
+// content_block_start, message_delta) are simply left unmarshaled.
+type anthropicStreamEvent struct {
+	Type  string `json:"type"`
+	Delta struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"delta"`
+	Error *anthropicError `json:"error"`
+}
+
+// Stream sends model + messages to Anthropic's /v1/messages endpoint with
+// stream: true and emits one Token per text delta as they arrive over SSE,
+// followed by a final Done token.
 func (p *Anthropic) Stream(ctx context.Context, model string, messages []Message) (<-chan Token, error) {
+	if p.APIKey == "" {
+		return nil, fmt.Errorf("anthropic: no API key configured (BYOK — set the env var named in config.toml)")
+	}
 	if p.Endpoint == "" {
 		return nil, fmt.Errorf("anthropic: no endpoint configured")
 	}
@@ -64,18 +87,16 @@ func (p *Anthropic) Stream(ctx context.Context, model string, messages []Message
 		return nil, fmt.Errorf("anthropic: build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("anthropic-version", anthropicVersion)
 	httpReq.Header.Set("Accept", "text/event-stream")
-	if p.APIKey != "" {
-		httpReq.Header.Set("x-api-key", p.APIKey)
-	}
+	httpReq.Header.Set("x-api-key", p.APIKey)
+	httpReq.Header.Set("anthropic-version", anthropicVersion)
 
 	client := p.Client
 	if client == nil {
 		client = http.DefaultClient
 	}
 
-	ch := make(chan Token, 8)
+	ch := make(chan Token, 4)
 	go func() {
 		defer close(ch)
 
@@ -86,80 +107,64 @@ func (p *Anthropic) Stream(ctx context.Context, model string, messages []Message
 		}
 		defer resp.Body.Close()
 
+		// A non-200 response is a plain JSON error body, not an SSE
+		// stream — read it whole rather than trying to scan it as SSE.
 		if resp.StatusCode != http.StatusOK {
-			ch <- Token{Err: fmt.Errorf("anthropic: %s", resp.Status)}
+			raw, _ := io.ReadAll(resp.Body)
+			var errBody struct {
+				Error *anthropicError `json:"error"`
+			}
+			msg := resp.Status
+			if json.Unmarshal(raw, &errBody) == nil && errBody.Error != nil {
+				msg = fmt.Sprintf("%s: %s", errBody.Error.Type, errBody.Error.Message)
+			}
+			ch <- Token{Err: fmt.Errorf("anthropic: %s", msg)}
 			return
 		}
 
-		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		eventType := ""
-		for scanner.Scan() {
-			line := scanner.Text()
-			switch {
-			case strings.HasPrefix(line, "event: "):
-				eventType = strings.TrimPrefix(line, "event: ")
-			case strings.HasPrefix(line, "data: "):
-				data := strings.TrimPrefix(line, "data: ")
-				evt, parseErr := parseAnthropicEvent(eventType, data)
-				if parseErr != nil {
-					continue
+		scanner := newSSEScanner(resp.Body)
+		for {
+			payload, ok := scanner.Next()
+			if !ok {
+				break
+			}
+
+			var event anthropicStreamEvent
+			if err := json.Unmarshal([]byte(payload), &event); err != nil {
+				ch <- Token{Err: fmt.Errorf("anthropic: decode stream event: %w", err)}
+				return
+			}
+
+			switch event.Type {
+			case "content_block_delta":
+				if event.Delta.Type == "text_delta" && event.Delta.Text != "" {
+					ch <- Token{Text: event.Delta.Text}
 				}
-				if evt.text != "" {
-					ch <- Token{Text: evt.text}
+			case "error":
+				msg := "stream error"
+				if event.Error != nil {
+					msg = fmt.Sprintf("%s: %s", event.Error.Type, event.Error.Message)
 				}
-				if evt.done {
-					ch <- Token{Done: true}
-					return
-				}
+				ch <- Token{Err: fmt.Errorf("anthropic: %s", msg)}
+				return
+			case "message_stop":
+				ch <- Token{Done: true}
+				return
+				// message_start, ping, content_block_start,
+				// content_block_stop, message_delta: nothing llmc needs
+				// yet — ignored.
 			}
 		}
-
 		if err := scanner.Err(); err != nil {
-			ch <- Token{Err: fmt.Errorf("anthropic: read stream: %w", err)}
-		} else {
-			ch <- Token{Done: true}
+			ch <- Token{Err: fmt.Errorf("anthropic: reading stream: %w", err)}
+			return
 		}
+		// Stream ended without an explicit message_stop (shouldn't happen
+		// in practice, but don't leave the caller hanging on the channel).
+		ch <- Token{Done: true}
 	}()
 
 	return ch, nil
-}
-
-type anthropicParsedEvent struct {
-	text string
-	done bool
-}
-
-func parseAnthropicEvent(eventType, data string) (anthropicParsedEvent, error) {
-	var raw struct {
-		Type string `json:"type"`
-		Delta *struct {
-			Text string `json:"text"`
-		} `json:"delta,omitempty"`
-		Error *struct {
-			Type    string `json:"type"`
-			Message string `json:"message"`
-		} `json:"error,omitempty"`
-	}
-	if err := json.Unmarshal([]byte(data), &raw); err != nil {
-		return anthropicParsedEvent{}, err
-	}
-
-	switch raw.Type {
-	case "content_block_delta":
-		if raw.Delta != nil {
-			return anthropicParsedEvent{text: raw.Delta.Text}, nil
-		}
-	case "error":
-		msg := raw.Type
-		if raw.Error != nil {
-			msg = fmt.Sprintf("%s: %s", raw.Error.Type, raw.Error.Message)
-		}
-		return anthropicParsedEvent{}, fmt.Errorf("%s", msg)
-	case "message_stop":
-		return anthropicParsedEvent{done: true}, nil
-	}
-	return anthropicParsedEvent{}, nil
 }
 
 // splitSystem pulls a leading role:"system" message out of the slice, since
